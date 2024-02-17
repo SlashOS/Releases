@@ -1,70 +1,61 @@
-name: Check Releases and Create TAR
+name: Check Releases Workflow
 
 on:
   workflow_dispatch:
 
 jobs:
-  check-releases:
+  check_releases:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v2
 
-      - name: Setup Node.js environment
-        uses: actions/setup-node@v2
+      - name: Setup Python
+        uses: actions/setup-python@v2
         with:
-          node-version: '14'
+          python-version: 3.x
 
       - name: Install dependencies
+        run: pip install requests
+
+      - name: List releases
+        id: list_releases
         run: |
-          sudo apt-get install -y tar
-          npm install @actions/http-client
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.repository }}"
+          URL="https://api.github.com/repos/$OWNER/$REPO/releases?per_page=100"
+          releases=$(curl -sSL -H "Authorization: token $TOKEN" $URL)
+          echo "::set-output name=releases::$releases"
 
-      - name: Check releases
-        uses: actions/github-script@v5
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          script: |
-            const fs = require('fs');
-            const httpm = require('@actions/http-client');
-            const httpc = new httpm.HttpClient('download-asset');
-            const { owner, repo } = context.repo
-            const releases = await github.rest.repos.listReleases({ owner, repo })
-            
-            for (const release of releases.data) {
-              if (release.name.includes('beyond1lte') || release.name.includes('a40')) {
-                const assets = await github.rest.repos.listReleaseAssets({
-                  owner,
-                  repo,
-                  release_id: release.id,
-                })
+      - name: Process releases
+        id: process_releases
+        run: |
+          releases="${{ steps.list_releases.outputs.releases }}"
+          filtered_releases=$(echo "$releases" | jq '.[] | select(.name | contains("beyond1lte") or contains("a40")) | select(.assets[].name | contains("recovery.img")) | select(.assets[].name | contains("recovery.tar") | not)')
+          echo "::set-output name=filtered_releases::$filtered_releases"
 
-                const imgAsset = assets.data.find(asset => asset.name === 'recovery.img')
-                const hasTar = assets.data.some(asset => asset.name === 'recovery.tar')
-                
-                if (imgAsset && !hasTar) {
-                  console.log(`Release ${release.name} has recovery.img but not recovery.tar`)
-                  const path = `./${imgAsset.name}`
-                  const response = await httpc.get(imgAsset.url);
-                  const arrayBuffer = await response.readBody();
-                  fs.writeFileSync(path, arrayBuffer, 'binary');
-                  
-                  const { execSync } = require('child_process');
-                  execSync(`tar -cvf recovery.tar ${imgAsset.name}`);
-
-                  const tarBuffer = fs.readFileSync('./recovery.tar');
-                  const uploadResponse = await github.rest.repos.uploadReleaseAsset({
-                    owner,
-                    repo,
-                    release_id: release.id,
-                    name: 'recovery.tar',
-                    data: tarBuffer,
-                    headers: {
-                      'content-type': 'application/gzip',
-                      'content-length': tarBuffer.length,
-                    },
-                  });
-                }
-              }
+      - name: Create recovery.tar
+        id: create_tar
+        run: |
+          filtered_releases="${{ steps.process_releases.outputs.filtered_releases }}"
+          for row in $(echo "${filtered_releases}" | jq -r '.[] | @base64'); do
+            _jq() {
+              echo ${row} | base64 --decode | jq -r ${1}
             }
+            tag=$(_jq '.tag_name')
+            asset_url=$(_jq '.assets[].url')
+            asset_name=$(_jq '.assets[].name')
+            download_url=$(curl -sSL -H "Authorization: token $TOKEN" $asset_url | jq -r '.browser_download_url')
+            curl -sSL -O -J -H "Authorization: token $TOKEN" $download_url
+            tar -cf recovery.tar recovery.img
+            mv recovery.tar recovery-${tag}.tar
+          done
+
+      - name: Upload recovery.tar
+        id: upload_tar
+        uses: actions/upload-artifact@v2
+        with:
+          name: recovery.tar
+          path: recovery-*.tar
