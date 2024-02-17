@@ -1,0 +1,67 @@
+name: Check Releases and Create TAR
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check-releases:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: Install dependencies
+        run: sudo apt-get install -y tar
+
+      - name: Check releases
+        uses: actions/github-script@v5
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo
+            const releases = await github.rest.repos.listReleases({ owner, repo })
+            
+            for (const release of releases.data) {
+              if (release.name.includes('beyond1lte') || release.name.includes('a40')) {
+                const assets = await github.rest.repos.listReleaseAssets({
+                  owner,
+                  repo,
+                  release_id: release.id,
+                })
+
+                const imgAsset = assets.data.find(asset => asset.name === 'recovery.img')
+                const hasTar = assets.data.some(asset => asset.name === 'recovery.tar')
+                
+                if (imgAsset && !hasTar) {
+                  console.log(`Release ${release.name} has recovery.img but not recovery.tar`)
+                  const path = `./${imgAsset.name}`
+                  const arrayBuffer = Buffer.from((await github.rest.repos.downloadReleaseAsset({
+                    owner,
+                    repo,
+                    asset_id: imgAsset.id,
+                    headers: {
+                      accept: "application/octet-stream",
+                    },
+                  })).data)
+                  fs.writeFileSync(path, arrayBuffer)
+                  
+                  const { execSync } = require('child_process');
+                  execSync(`tar -cvf recovery.tar ${imgAsset.name}`);
+
+                  const tarBuffer = fs.readFileSync('./recovery.tar');
+                  const uploadResponse = await github.rest.repos.uploadReleaseAsset({
+                    owner,
+                    repo,
+                    release_id: release.id,
+                    name: 'recovery.tar',
+                    data: tarBuffer,
+                    headers: {
+                      'content-type': 'application/gzip',
+                      'content-length': tarBuffer.length,
+                    },
+                  });
+                }
+              }
+            }
